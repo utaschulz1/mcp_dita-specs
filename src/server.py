@@ -247,6 +247,7 @@ def _ingest_results(
     code_stored, code_delete_ok = 0, True
     if os.getenv("USE_AGENTIC_RAG", "false") == "true":
         code_urls, code_chunk_numbers, code_examples, code_summaries, code_metas = [], [], [], [], []
+        global_idx = 0
 
         for doc in crawl_results:
             src_url = doc["url"]
@@ -262,7 +263,6 @@ def _ingest_results(
 
             parsed = urlparse(src_url)
             source_id = parsed.netloc or parsed.path
-            global_idx = len(code_examples)
             for b, summary in zip(blocks, block_summaries):
                 code_urls.append(src_url)
                 code_chunk_numbers.append(global_idx)

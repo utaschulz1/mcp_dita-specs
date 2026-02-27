@@ -69,7 +69,7 @@ def create_embedding(text: str) -> List[float]:
 
 
 # ---------------------------------------------------------------------------
-# Contextual embeddings (optional, USE_CONTEXTUAL_EMBEDDINGS=true)
+# Contextual embeddings (optional, USE_CONTEXTUAL_EMBEDDINGS=false for DITA specs)
 # ---------------------------------------------------------------------------
 
 def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
@@ -106,10 +106,10 @@ def _process_chunk_with_context(args: Tuple[str, str, str]) -> Tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Chunking
+# Chunking (adjusted to small 30 for dita specs)
 # ---------------------------------------------------------------------------
 
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
+def smart_chunk_markdown(text: str, chunk_size: int = 30) -> List[str]:
     """Split markdown into chunks, respecting code blocks and paragraphs."""
     chunks = []
     start = 0
@@ -154,7 +154,7 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Code block extraction (optional, USE_AGENTIC_RAG=true)
+# Code block extraction (optional, USE_AGENTIC_RAG=true) (adjusted to smaller context window and DITA specific prompt)
 # ---------------------------------------------------------------------------
 
 def extract_code_blocks(markdown_content: str, min_length: int = 1000) -> List[Dict[str, Any]]:
@@ -211,7 +211,7 @@ def extract_code_blocks(markdown_content: str, min_length: int = 1000) -> List[D
 def generate_code_example_summary(code: str, context_before: str, context_after: str) -> str:
     model = os.getenv("MODEL_CHOICE")
     prompt = f"""<context_before>
-{context_before[-500:]}
+{context_before[-200:]}
 </context_before>
 
 <code_example>
@@ -219,10 +219,13 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
 </code_example>
 
 <context_after>
-{context_after[:500]}
+{context_after[:200]}
 </context_after>
 
-Based on the code example and its surrounding context, provide a concise summary (2-3 sentences) describing what this code demonstrates and its purpose."""
+Based on the DITA XML example and its surrounding context, write a 2-3 sentence summary that:
+- Names the DITA element(s) and key attributes shown
+- Explains the authoring scenario or output behavior this demonstrates
+- Uses DITA terminology (topic type, map, specialization, etc.) where relevant"""
 
     try:
         response = openai.chat.completions.create(

@@ -30,11 +30,11 @@ Add to your MCP config:
 ```json
 {
   "mcpServers": {
-    "crawl4ai2vectordb": {
+    "mcp_dita-specs": {
       "type": "stdio",
       "command": "uv",
       "args": ["run", "python", "-u", "src/server.py"],
-      "cwd": "/path/to/mcp_crawl4ai2vectordb"
+      "cwd": "/home/hpz440/projects/mcp_dita-specs"
     }
   }
 }
