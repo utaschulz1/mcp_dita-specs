@@ -1,5 +1,5 @@
 """
-mcp-crawl4ai2vectordb
+mcp-dita-specs/src/server.py
 
 MCP server for crawling web documentation and storing it in a Supabase
 vector database. Ingestion-only: no search, no reranking, no Neo4j.
@@ -45,6 +45,11 @@ from utils import (
 # Load .env from project root (one level up from src/)
 _project_root = Path(__file__).resolve().parent.parent
 load_dotenv(_project_root / ".env", override=True)
+
+# Redirect stdout to stderr in stdio mode so crawl4ai logs don't corrupt the protocol
+#import sys
+#if os.getenv("TRANSPORT", "stdio") == "stdio":
+    #sys.stdout = sys.stderr
 
 # ---------------------------------------------------------------------------
 # Module-level singletons
@@ -93,7 +98,7 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP(
-    "mcp-crawl4ai2vectordb",
+    "mcp-dita-specs",
     instructions="Crawl web documentation and store it in a Supabase vector database.",
     lifespan=_lifespan,
     host=os.getenv("HOST", "0.0.0.0"),
@@ -148,9 +153,12 @@ async def _crawl_batch(
 async def _crawl_recursive(
     crawler: AsyncWebCrawler,
     start_urls: List[str],
+    supabase_client: Client,
+    crawl_type: str = "webpage",
     max_depth: int = 3,
     max_concurrent: int = 10,
-) -> List[Dict[str, Any]]:
+    chunk_size: int = 5000,
+) -> Dict[str, Any]:
     config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
@@ -161,9 +169,27 @@ async def _crawl_recursive(
     def normalize(url: str) -> str:
         return urldefrag(url)[0]
 
+    # Only follow links under the same path prefix as the starting URL.
+    # If the start URL is a page (no trailing slash), use its parent directory.
+    parsed_start = urlparse(normalize(start_urls[0]))
+    path = parsed_start.path
+    if not path.endswith("/"):
+        path = path.rsplit("/", 1)[0] + "/"
+    url_prefix = f"{parsed_start.scheme}://{parsed_start.netloc}{path}"
+
+    def is_in_scope(url: str) -> bool:
+        return url.startswith(url_prefix)
+
     visited: set = set()
     current = {normalize(u) for u in start_urls}
-    all_results: List[Dict[str, Any]] = []
+    cumulative_stats: Dict[str, Any] = {
+        "chunks_stored": 0,
+        "code_examples_stored": 0,
+        "sources_updated": 0,
+        "delete_ok": True,
+        "sources_ok": True,
+        "pages_crawled": 0,
+    }
 
     for _ in range(max_depth):
         to_crawl = [u for u in current if u not in visited]
@@ -172,27 +198,39 @@ async def _crawl_recursive(
 
         results = await crawler.arun_many(urls=to_crawl, config=config, dispatcher=dispatcher)
         next_level: set = set()
+        depth_results: List[Dict[str, Any]] = []
 
         for r in results:
             norm = normalize(r.url)
             visited.add(norm)
             if r.success and r.markdown:
-                all_results.append({"url": r.url, "markdown": r.markdown})
+                depth_results.append({"url": r.url, "markdown": r.markdown})
                 for link in r.links.get("internal", []):
                     nxt = normalize(link["href"])
-                    if nxt not in visited:
+                    if nxt not in visited and is_in_scope(nxt):
                         next_level.add(nxt)
 
         current = next_level
 
-    return all_results
+        if depth_results:
+            stats = await _ingest_results(supabase_client, depth_results, crawl_type, chunk_size=chunk_size)
+            cumulative_stats["chunks_stored"] += stats["chunks_stored"]
+            cumulative_stats["code_examples_stored"] += stats["code_examples_stored"]
+            cumulative_stats["sources_updated"] += stats["sources_updated"]
+            cumulative_stats["pages_crawled"] += len(depth_results)
+            if not stats["delete_ok"]:
+                cumulative_stats["delete_ok"] = False
+            if not stats["sources_ok"]:
+                cumulative_stats["sources_ok"] = False
+
+    return cumulative_stats
 
 
 # ---------------------------------------------------------------------------
 # Shared ingestion logic
 # ---------------------------------------------------------------------------
 
-def _ingest_results(
+async def _ingest_results(
     supabase_client: Client,
     crawl_results: List[Dict[str, Any]],
     crawl_type: str,
@@ -378,37 +416,42 @@ async def smart_crawl_url(
         if _is_txt(url):
             crawl_results = await _crawl_text_file(crawler, url)
             crawl_type = "text_file"
+            if not crawl_results:
+                return json.dumps({"success": False, "url": url, "error": "No content found"}, indent=2)
+            stats = await _ingest_results(supabase_client, crawl_results, crawl_type, chunk_size=chunk_size)
+            stats["pages_crawled"] = len(crawl_results)
         elif _is_sitemap(url):
             sitemap_urls = _parse_sitemap(url)
             if not sitemap_urls:
                 return json.dumps({"success": False, "url": url, "error": "No URLs found in sitemap"}, indent=2)
             crawl_results = await _crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
             crawl_type = "sitemap"
+            if not crawl_results:
+                return json.dumps({"success": False, "url": url, "error": "No content found"}, indent=2)
+            stats = await _ingest_results(supabase_client, crawl_results, crawl_type, chunk_size=chunk_size)
+            stats["pages_crawled"] = len(crawl_results)
         else:
-            crawl_results = await _crawl_recursive(
-                crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent
-            )
             crawl_type = "webpage"
-
-        if not crawl_results:
-            return json.dumps({"success": False, "url": url, "error": "No content found"}, indent=2)
-
-        stats = _ingest_results(
-            supabase_client, crawl_results, crawl_type=crawl_type,
-            chunk_size=chunk_size,
-        )
+            stats = await _crawl_recursive(
+                crawler, [url],
+                supabase_client=supabase_client,
+                crawl_type=crawl_type,
+                max_depth=max_depth,
+                max_concurrent=max_concurrent,
+                chunk_size=chunk_size,
+            )
+            if stats["pages_crawled"] == 0:
+                return json.dumps({"success": False, "url": url, "error": "No content found"}, indent=2)
 
         return json.dumps({
             "success": stats["sources_ok"] and stats["chunks_stored"] > 0,
             "url": url,
             "crawl_type": crawl_type,
-            "pages_crawled": len(crawl_results),
+            "pages_crawled": stats["pages_crawled"],
             "chunks_stored": stats["chunks_stored"],
             "code_examples_stored": stats["code_examples_stored"],
             "delete_ok": stats["delete_ok"],
             "sources_updated": stats["sources_updated"],
-            "urls_crawled": [d["url"] for d in crawl_results[:5]]
-                            + (["…"] if len(crawl_results) > 5 else []),
         }, indent=2)
 
     except Exception as e:
