@@ -5,6 +5,10 @@ Credits: [craw4ai](https://github.com/unclecode/crawl4ai) and [Cole Medin's mcp 
 
 **Responsibility**: ingestion only — crawl, chunk, embed, store. No search, no reranking, no Neo4j.
 
+Added:
+- script: API call to github tree to construct links from DITA 2.0 doku
+- links.txt crawl functionality
+
 ## Tools
 
 | Tool | Description |
