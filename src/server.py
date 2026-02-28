@@ -129,12 +129,15 @@ def _parse_sitemap(sitemap_url: str) -> List[str]:
     return []
 
 
-async def _crawl_text_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
-    result = await crawler.arun(url=url, config=CrawlerRunConfig())
-    if result.success and result.markdown:
-        return [{"url": url, "markdown": result.markdown}]
-    print(f"Failed to crawl {url}: {result.error_message}")
-    return []
+async def _crawl_text_file(crawler: AsyncWebCrawler, url: str, max_concurrent: int = 10) -> List[Dict[str, Any]]:
+    resp = requests.get(url, timeout=30)
+    if resp.status_code != 200:
+        print(f"Failed to fetch {url}: HTTP {resp.status_code}")
+        return []
+    urls = [line.strip() for line in resp.text.splitlines() if line.strip() and not line.strip().startswith("#")]
+    if not urls:
+        return []
+    return await _crawl_batch(crawler, urls, max_concurrent=max_concurrent)
 
 
 async def _crawl_batch(
@@ -414,7 +417,7 @@ async def smart_crawl_url(
         supabase_client = ctx.request_context.lifespan_context.supabase_client
 
         if _is_txt(url):
-            crawl_results = await _crawl_text_file(crawler, url)
+            crawl_results = await _crawl_text_file(crawler, url, max_concurrent=max_concurrent)
             crawl_type = "text_file"
             if not crawl_results:
                 return json.dumps({"success": False, "url": url, "error": "No content found"}, indent=2)
