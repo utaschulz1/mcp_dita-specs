@@ -184,17 +184,31 @@ async def perform_rag_query(
     """
     try:
         supabase_client = ctx.request_context.lifespan_context.supabase_client
-        use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
+        use_keyword_search = os.getenv("USE_KEYWORD_SEARCH", "false") == "true"
+        use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true" and not use_keyword_search
 
         filter_metadata = None
         if source and source.strip():
             filter_metadata = {"source": source}
 
-        if use_hybrid_search:
+        if use_keyword_search:
+            keyword_query = (
+                supabase_client.from_('crawled_pages')
+                .select('id, url, chunk_number, content, metadata, source_id')
+                .ilike('content', f'%{query}%')
+            )
+            if source and source.strip():
+                keyword_query = keyword_query.eq('source_id', source)
+            keyword_response = keyword_query.limit(match_count * 3).execute()
+            results = [
+                {**row, 'similarity': None}
+                for row in (keyword_response.data or [])
+            ]
+        elif use_hybrid_search:
             vector_results = search_documents(
                 client=supabase_client,
                 query=query,
-                match_count=match_count * 2,
+                match_count=match_count * 3,
                 filter_metadata=filter_metadata,
             )
 
@@ -205,7 +219,7 @@ async def perform_rag_query(
             )
             if source and source.strip():
                 keyword_query = keyword_query.eq('source_id', source)
-            keyword_response = keyword_query.limit(match_count * 2).execute()
+            keyword_response = keyword_query.limit(match_count * 3).execute()
             keyword_results = keyword_response.data if keyword_response.data else []
 
             seen_ids = set()
@@ -241,10 +255,13 @@ async def perform_rag_query(
 
             results = combined_results[:match_count]
         else:
+            use_reranking = os.getenv("USE_RERANKING", "false") == "true"
+            # Fetch extra candidates when reranking so the reranker sees a wider pool
+            fetch_count = match_count * 3 if use_reranking else match_count
             results = search_documents(
                 client=supabase_client,
                 query=query,
-                match_count=match_count,
+                match_count=fetch_count,
                 filter_metadata=filter_metadata,
             )
 
@@ -256,6 +273,7 @@ async def perform_rag_query(
                 results,
                 content_key="content",
             )
+            results = results[:match_count]
 
         formatted_results = []
         for result in results:
@@ -267,13 +285,14 @@ async def perform_rag_query(
             }
             if "rerank_score" in result:
                 formatted_result["rerank_score"] = result["rerank_score"]
-            formatted_results.append(formatted_result)
+            if result.get("rerank_score", 0) >= -5:
+                formatted_results.append(formatted_result)
 
         return json.dumps({
             "success": True,
             "query": query,
             "source_filter": source,
-            "search_mode": "hybrid" if use_hybrid_search else "vector",
+            "search_mode": "keyword" if use_keyword_search else ("hybrid" if use_hybrid_search else "vector"),
             "reranking_applied": (
                 use_reranking
                 and ctx.request_context.lifespan_context.reranking_model is not None
@@ -398,7 +417,8 @@ async def search_code_examples(
             }
             if "rerank_score" in result:
                 formatted_result["rerank_score"] = result["rerank_score"]
-            formatted_results.append(formatted_result)
+            if result.get("rerank_score", 0) >= -5:
+                formatted_results.append(formatted_result)
 
         return json.dumps({
             "success": True,
@@ -440,12 +460,17 @@ async def list_spec_files(ctx: Context, source_id: str, url_prefix: str) -> str:
     try:
         supabase_client = ctx.request_context.lifespan_context.supabase_client
 
+        # Normalize: ensure https and no trailing slash
+        prefix = url_prefix.strip().rstrip('/')
+        if prefix.startswith('http://'):
+            prefix = 'https://' + prefix[7:]
+
         response = (
             supabase_client
             .from_('crawled_pages')
             .select('url')
             .eq('source_id', source_id)
-            .ilike('url', f'{url_prefix}%')
+            .ilike('url', f'{prefix}%')
             .execute()
         )
 

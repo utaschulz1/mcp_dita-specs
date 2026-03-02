@@ -1,8 +1,8 @@
 """
 mcp-dita-specs/src/server.py
 
-MCP server for crawling web documentation and storing it in a Supabase
-vector database. Ingestion-only: no search, no reranking, no Neo4j.
+MCP server for crawling dita web documentation and storing it in a Supabase
+vector database. Ingestion-only: no search, no reranking, no Neo4j. Uses .body CSS selector in _CRAWL_CONFIG.
 """
 import asyncio
 import json
@@ -62,26 +62,33 @@ _supabase_client: Client = get_supabase_client()
 _crawler: Optional[AsyncWebCrawler] = None
 _crawler_lock = asyncio.Lock()
 
-# Shared crawl config for all content pages.
-# css_selector=".body" targets the main spec content div on dita-lang.org,
-# excluding the left-nav sidebar, related-links, and chapter navigation.
-# PruningContentFilter acts as a safety net for any remaining low-density blocks.
-_CRAWL_CONFIG = CrawlerRunConfig(
-    cache_mode=CacheMode.BYPASS,
-    stream=False,
-    css_selector=".body",
-    excluded_tags=["nav", "footer", "header", "aside"],
-    word_count_threshold=10,
-    remove_overlay_elements=True,
-    markdown_generator=DefaultMarkdownGenerator(
-        content_filter=PruningContentFilter(
-            threshold=0.45,
-            threshold_type="fixed",
-            min_word_threshold=20,
+def _make_crawl_config(css_selector: str = ".body") -> CrawlerRunConfig:
+    """Build a CrawlerRunConfig with content filtering and a given CSS selector.
+
+    css_selector targets the main content container, excluding nav/sidebar.
+    Default '.body' works for dita-lang.org. Pass a different selector for
+    other sites (e.g. 'main', 'article', '#content').
+    """
+    return CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        stream=False,
+        css_selector=css_selector,
+        excluded_tags=["nav", "footer", "header", "aside"],
+        word_count_threshold=10,
+        remove_overlay_elements=True,
+        markdown_generator=DefaultMarkdownGenerator(
+            content_filter=PruningContentFilter(
+                threshold=0.45,
+                threshold_type="fixed",
+                min_word_threshold=20,
+            ),
+            options={"ignore_links": False, "body_width": 0},
         ),
-        options={"ignore_links": False, "body_width": 0},
-    ),
-)
+    )
+
+
+# Default config singleton (dita-lang.org)
+_CRAWL_CONFIG = _make_crawl_config()
 
 
 def _extract_markdown(result) -> str:
@@ -162,7 +169,9 @@ def _parse_sitemap(sitemap_url: str) -> List[str]:
     return []
 
 
-async def _crawl_text_file(crawler: AsyncWebCrawler, url: str, max_concurrent: int = 10) -> List[Dict[str, Any]]:
+async def _crawl_text_file(
+    crawler: AsyncWebCrawler, url: str, max_concurrent: int = 10, config: CrawlerRunConfig = None
+) -> List[Dict[str, Any]]:
     resp = requests.get(url, timeout=30)
     if resp.status_code != 200:
         print(f"Failed to fetch {url}: HTTP {resp.status_code}")
@@ -170,18 +179,18 @@ async def _crawl_text_file(crawler: AsyncWebCrawler, url: str, max_concurrent: i
     urls = [line.strip() for line in resp.text.splitlines() if line.strip() and not line.strip().startswith("#")]
     if not urls:
         return []
-    return await _crawl_batch(crawler, urls, max_concurrent=max_concurrent)
+    return await _crawl_batch(crawler, urls, max_concurrent=max_concurrent, config=config)
 
 
 async def _crawl_batch(
-    crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10
+    crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10, config: CrawlerRunConfig = None
 ) -> List[Dict[str, Any]]:
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
         check_interval=1.0,
         max_session_permit=max_concurrent,
     )
-    results = await crawler.arun_many(urls=urls, config=_CRAWL_CONFIG, dispatcher=dispatcher)
+    results = await crawler.arun_many(urls=urls, config=config or _CRAWL_CONFIG, dispatcher=dispatcher)
     return [
         {"url": r.url, "markdown": _extract_markdown(r)}
         for r in results
@@ -197,6 +206,7 @@ async def _crawl_recursive(
     max_depth: int = 3,
     max_concurrent: int = 10,
     chunk_size: int = 5000,
+    config: CrawlerRunConfig = None,
 ) -> Dict[str, Any]:
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
@@ -234,7 +244,7 @@ async def _crawl_recursive(
         if not to_crawl:
             break
 
-        results = await crawler.arun_many(urls=to_crawl, config=_CRAWL_CONFIG, dispatcher=dispatcher)
+        results = await crawler.arun_many(urls=to_crawl, config=config or _CRAWL_CONFIG, dispatcher=dispatcher)
         next_level: set = set()
         depth_results: List[Dict[str, Any]] = []
 
@@ -376,7 +386,7 @@ async def _ingest_results(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def crawl_single_page(ctx: Context, url: str) -> str:
+async def crawl_single_page(ctx: Context, url: str, css_selector: str = ".body") -> str:
     """
     Crawl a single web page and store its content in Supabase.
 
@@ -386,12 +396,14 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
     Args:
         ctx: MCP server context
         url: URL of the web page to crawl
+        css_selector: CSS selector for the main content container (default: ".body").
+                      Use "main", "article", "#content", etc. for other sites.
     """
     try:
         crawler = await _get_crawler()
         supabase_client = ctx.request_context.lifespan_context.supabase_client
 
-        result = await crawler.arun(url=url, config=_CRAWL_CONFIG)
+        result = await crawler.arun(url=url, config=_make_crawl_config(css_selector))
 
         if not result.success or not result.markdown:
             return json.dumps({"success": False, "url": url, "error": result.error_message}, indent=2)
@@ -431,6 +443,7 @@ async def smart_crawl_url(
     max_depth: int = 3,
     max_concurrent: int = 10,
     chunk_size: int = 5000,
+    css_selector: str = ".body",
 ) -> str:
     """
     Intelligently crawl a URL and store all content in Supabase.
@@ -446,13 +459,16 @@ async def smart_crawl_url(
         max_depth: Maximum recursion depth for webpages (default: 3)
         max_concurrent: Maximum parallel browser sessions (default: 10)
         chunk_size: Maximum characters per content chunk (default: 5000)
+        css_selector: CSS selector for the main content container (default: ".body").
+                      Use "main", "article", "#content", etc. for other sites.
     """
     try:
         crawler = await _get_crawler()
         supabase_client = ctx.request_context.lifespan_context.supabase_client
+        config = _make_crawl_config(css_selector)
 
         if _is_txt(url):
-            crawl_results = await _crawl_text_file(crawler, url, max_concurrent=max_concurrent)
+            crawl_results = await _crawl_text_file(crawler, url, max_concurrent=max_concurrent, config=config)
             crawl_type = "text_file"
             if not crawl_results:
                 return json.dumps({"success": False, "url": url, "error": "No content found"}, indent=2)
@@ -462,7 +478,7 @@ async def smart_crawl_url(
             sitemap_urls = _parse_sitemap(url)
             if not sitemap_urls:
                 return json.dumps({"success": False, "url": url, "error": "No URLs found in sitemap"}, indent=2)
-            crawl_results = await _crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
+            crawl_results = await _crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent, config=config)
             crawl_type = "sitemap"
             if not crawl_results:
                 return json.dumps({"success": False, "url": url, "error": "No content found"}, indent=2)
@@ -477,6 +493,7 @@ async def smart_crawl_url(
                 max_depth=max_depth,
                 max_concurrent=max_concurrent,
                 chunk_size=chunk_size,
+                config=config,
             )
             if stats["pages_crawled"] == 0:
                 return json.dumps({"success": False, "url": url, "error": "No content found"}, indent=2)

@@ -211,7 +211,7 @@ def extract_code_blocks(markdown_content: str, min_length: int = 1000) -> List[D
 def generate_code_example_summary(code: str, context_before: str, context_after: str) -> str:
     model = os.getenv("MODEL_CHOICE")
     prompt = f"""<context_before>
-{context_before[-200:]}
+{context_before[-500:]}
 </context_before>
 
 <code_example>
