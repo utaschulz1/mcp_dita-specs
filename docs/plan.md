@@ -1,5 +1,8 @@
 # Plan: DITA Specs MCP Server (retrieval-only)
 
+## 0. Context
+This document contains instructions and context to ammend the files /home/hpz440/projects/mcp_dita-specs/src-searchtool/crawl4ai_mcp.py and /home/hpz440/projects/mcp_dita-specs/src-searchtool/utils.py in order to build an information retrieval mcp server. The server should contain tools to search my dita-specs supabase. The new server should be saved here /home/hpz440/projects/mcp_dita-specs/src-searchtool/server.py  The utils file can be overwritten with the new utils. The plan serves for Claude to write an implentation task list.
+
 ## 1. What the existing tools do
 
 ### `get_available_sources`
@@ -41,6 +44,7 @@ code content + summary per hit.
 - Simplified `lifespan` (no Neo4j, no browser)
 - `rerank_results` helper
 - `get_available_sources` (**updated** — see below)
+- `list_spec_files` (**new** see below)
 - `perform_rag_query` (unchanged logic, cleaner context)
 - `search_code_examples` (unchanged — useful for DITA XML markup examples stored
   during agentic ingestion)
@@ -48,9 +52,9 @@ code content + summary per hit.
 ### Updated: `get_available_sources`
 
 Instead of querying only the `sources` table (one row per netloc), this tool now
-queries `crawled_pages` to derive sub-collections at `netloc/first-path-segment`
-granularity. This lets Claude discover that `dita-lang.org` has two distinct
-sub-collections (`/1.3` and `/dita`) rather than appearing as a single opaque blob.
+queries `crawled_pages` to derive sub-collections at `netloc/first-path-segment/second-path-segmt`
+granularity. This lets Claude discover that `dita-lang.org` has distinct
+sub-collections rather than appearing as a single opaque blob.
 
 Each collection entry in the response contains:
 - **`label`** — human/Claude-readable name, e.g. `dita-lang.org/1.3`.
@@ -58,25 +62,21 @@ Each collection entry in the response contains:
 - **`url_prefix`** — the actual URL prefix used for filtering, e.g.
   `https://dita-lang.org/1.3`. This is the value to pass to `list_spec_files`.
 - **`file_count`** — number of distinct URLs in that sub-collection.
-- **`summary`** — the existing per-netloc summary from the `sources` table,
-  shared across all sub-collections of the same domain.
 
-SQL to derive sub-collections (run inside the server, not as a stored RPC):
-```sql
-SELECT
-  source_id,
-  COALESCE(
-    NULLIF(REGEXP_REPLACE(url, '^https?://[^/]+(/[^/?#]*)?.*$', '\1'), ''),
-    '(root)'
-  ) AS first_segment,
-  COUNT(DISTINCT url) AS file_count
-FROM crawled_pages
-GROUP BY source_id, first_segment
-ORDER BY source_id, first_segment
+
+Derive sub-collections is done by supabase with the query "get_specs_collections":
+```python
+def get_available_sources():
+    # We call the 'shortcut' we created in the database
+    response = supabase.rpc('get_specs_collections').execute()
+    
+    if response.data:
+        # response.data will look like: 
+        # [{'source_id': 'dita-lang.org', 'url_prefix': 'https://dita-lang.org/dita/archspecs', 'file_count': 850}, ...]
+        return response.data
+    return []
 ```
 
-The `url_prefix` for each row is reconstructed as
-`https://{source_id}{first_segment}` (replacing `(root)` with empty string).
 
 ### Add — two new tools
 
@@ -85,8 +85,18 @@ Returns **all distinct URLs** for a given sub-collection in one response (~950
 to ~2500 URLs is well within MCP message limits as a JSON array).
 No pagination — the `url_prefix` filter keeps the list focused.
 
-```
-list_spec_files(url_prefix: str) -> str
+```python
+def list_spec_files(source_id: str, url_prefix: str = None):
+    query = supabase.table('crawled_pages').select('url').eq('source_id', source_id)
+    
+    # If a prefix was chosen (like /dita), we filter the list
+    if url_prefix and url_prefix != '/':
+        # We use 'like' to match anything starting with that folder
+        # e.g., https://dita-lang.org/dita/%
+        query = query.like('url', f'%{url_prefix}/%')
+    
+    response = query.execute()
+    return [item['url'] for item in response.data]
 ```
 
 Input is the `url_prefix` value returned by `get_available_sources`
@@ -103,7 +113,7 @@ ORDER BY url
 
 Returns a JSON list of URLs and a `count`.
 
-#### `retrieve_content_by_links`
+#### `retrieve_content_by_links` with limit of 10 most relevant links
 Given one or more URLs (exact matches to values stored in the `url` column),
 retrieves **all chunks** for each URL, sorted by `chunk_number`, and
 concatenates them into a single string per file.
@@ -240,5 +250,5 @@ Remove everything related to ingestion:
 - [x] Suggest a rewrite plan
 - [x] Think about additional information needed (questions above)
 - [x] Write this plan to the current directory as .md
-- [ ] Await user feedback / additional information
+- [x] Await user feedback / additional information
 - [ ] Implement the rewrite

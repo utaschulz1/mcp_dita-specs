@@ -28,6 +28,8 @@ from crawl4ai import (
     CacheMode,
     MemoryAdaptiveDispatcher,
 )
+from crawl4ai.content_filter_strategy import PruningContentFilter
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 
 from utils import (
     get_supabase_client,
@@ -59,6 +61,37 @@ _supabase_client: Client = get_supabase_client()
 
 _crawler: Optional[AsyncWebCrawler] = None
 _crawler_lock = asyncio.Lock()
+
+# Shared crawl config for all content pages.
+# css_selector=".body" targets the main spec content div on dita-lang.org,
+# excluding the left-nav sidebar, related-links, and chapter navigation.
+# PruningContentFilter acts as a safety net for any remaining low-density blocks.
+_CRAWL_CONFIG = CrawlerRunConfig(
+    cache_mode=CacheMode.BYPASS,
+    stream=False,
+    css_selector=".body",
+    excluded_tags=["nav", "footer", "header", "aside"],
+    word_count_threshold=10,
+    remove_overlay_elements=True,
+    markdown_generator=DefaultMarkdownGenerator(
+        content_filter=PruningContentFilter(
+            threshold=0.45,
+            threshold_type="fixed",
+            min_word_threshold=20,
+        ),
+        options={"ignore_links": False, "body_width": 0},
+    ),
+)
+
+
+def _extract_markdown(result) -> str:
+    """Return the best available markdown string from a CrawlResult."""
+    md = result.markdown
+    if hasattr(md, "fit_markdown") and md.fit_markdown:
+        return md.fit_markdown
+    if hasattr(md, "raw_markdown") and md.raw_markdown:
+        return md.raw_markdown
+    return str(md)  # legacy fallback
 
 
 async def _get_crawler() -> AsyncWebCrawler:
@@ -143,14 +176,17 @@ async def _crawl_text_file(crawler: AsyncWebCrawler, url: str, max_concurrent: i
 async def _crawl_batch(
     crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10
 ) -> List[Dict[str, Any]]:
-    config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
         check_interval=1.0,
         max_session_permit=max_concurrent,
     )
-    results = await crawler.arun_many(urls=urls, config=config, dispatcher=dispatcher)
-    return [{"url": r.url, "markdown": r.markdown} for r in results if r.success and r.markdown]
+    results = await crawler.arun_many(urls=urls, config=_CRAWL_CONFIG, dispatcher=dispatcher)
+    return [
+        {"url": r.url, "markdown": _extract_markdown(r)}
+        for r in results
+        if r.success and r.markdown
+    ]
 
 
 async def _crawl_recursive(
@@ -162,7 +198,6 @@ async def _crawl_recursive(
     max_concurrent: int = 10,
     chunk_size: int = 5000,
 ) -> Dict[str, Any]:
-    config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
         check_interval=1.0,
@@ -199,7 +234,7 @@ async def _crawl_recursive(
         if not to_crawl:
             break
 
-        results = await crawler.arun_many(urls=to_crawl, config=config, dispatcher=dispatcher)
+        results = await crawler.arun_many(urls=to_crawl, config=_CRAWL_CONFIG, dispatcher=dispatcher)
         next_level: set = set()
         depth_results: List[Dict[str, Any]] = []
 
@@ -207,7 +242,7 @@ async def _crawl_recursive(
             norm = normalize(r.url)
             visited.add(norm)
             if r.success and r.markdown:
-                depth_results.append({"url": r.url, "markdown": r.markdown})
+                depth_results.append({"url": r.url, "markdown": _extract_markdown(r)})
                 for link in r.links.get("internal", []):
                     nxt = normalize(link["href"])
                     if nxt not in visited and is_in_scope(nxt):
@@ -251,6 +286,8 @@ async def _ingest_results(
     for doc in crawl_results:
         src_url = doc["url"]
         md = doc["markdown"]
+        if len(md.strip()) < 50:  # skip stub/empty pages
+            continue
         parsed = urlparse(src_url)
         source_id = parsed.netloc or parsed.path
 
@@ -292,7 +329,7 @@ async def _ingest_results(
 
         for doc in crawl_results:
             src_url = doc["url"]
-            blocks = extract_code_blocks(doc["markdown"])
+            blocks = extract_code_blocks(doc["markdown"], min_length=50)
             if not blocks:
                 continue
 
@@ -354,20 +391,18 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         crawler = await _get_crawler()
         supabase_client = ctx.request_context.lifespan_context.supabase_client
 
-        result = await crawler.arun(
-            url=url,
-            config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False),
-        )
+        result = await crawler.arun(url=url, config=_CRAWL_CONFIG)
 
         if not result.success or not result.markdown:
             return json.dumps({"success": False, "url": url, "error": result.error_message}, indent=2)
 
         parsed = urlparse(url)
         source_id = parsed.netloc or parsed.path
+        md_content = _extract_markdown(result)
 
-        stats = _ingest_results(
+        stats = await _ingest_results(
             supabase_client,
-            [{"url": url, "markdown": result.markdown}],
+            [{"url": url, "markdown": md_content}],
             crawl_type="single_page",
         )
 
@@ -378,7 +413,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             "chunks_stored": stats["chunks_stored"],
             "code_examples_stored": stats["code_examples_stored"],
             "delete_ok": stats["delete_ok"],
-            "content_length": len(result.markdown),
+            "content_length": len(md_content),
             "links_count": {
                 "internal": len(result.links.get("internal", [])),
                 "external": len(result.links.get("external", [])),
@@ -464,27 +499,44 @@ async def smart_crawl_url(
 @mcp.tool()
 async def get_available_sources(ctx: Context) -> str:
     """
-    List all documentation sources that have been crawled and stored.
+    List all crawled sources at sub-collection granularity.
 
-    Returns source IDs (domains), their summaries, word counts, and timestamps.
-    Use this before deciding what to crawl or delete.
+    Returns entries grouped by domain + first path segment, so
+    "dita-lang.org/dita" and "dita-lang.org/1.3" appear as separate entries.
+
+    Each entry contains:
+      - label:      Human-readable name, e.g. "dita-lang.org/dita"
+      - source_id:  Domain only, e.g. "dita-lang.org"
+      - url_prefix: Full URL prefix for the sub-collection
+      - file_count: Number of distinct pages stored
+
+    Use this before deciding what to re-crawl or delete.
     """
     try:
         supabase_client = ctx.request_context.lifespan_context.supabase_client
-        result = supabase_client.from_("sources").select("*").order("source_id").execute()
 
-        sources = [
-            {
-                "source_id": s.get("source_id"),
-                "summary": s.get("summary"),
-                "total_words": s.get("total_words"),
-                "created_at": s.get("created_at"),
-                "updated_at": s.get("updated_at"),
-            }
-            for s in (result.data or [])
-        ]
+        response = supabase_client.rpc('get_specs_collections').execute()
 
-        return json.dumps({"success": True, "sources": sources, "count": len(sources)}, indent=2)
+        collections = []
+        if response.data:
+            for row in response.data:
+                # RPC returns a relative path (e.g. "/1.3/dita"), not a full URL
+                url_prefix_path = row.get('url_prefix', '')
+                source_id = row.get('source_id', '')
+                file_count = row.get('file_count', 0)
+
+                path = url_prefix_path.rstrip('/')
+                label = f"{source_id}{path}" if path and path != '/' else f"{source_id}/(root)"
+                full_url_prefix = f"https://{source_id}{path}" if path and path != '/' else f"https://{source_id}"
+
+                collections.append({
+                    "label": label,
+                    "source_id": source_id,
+                    "url_prefix": full_url_prefix,
+                    "file_count": file_count,
+                })
+
+        return json.dumps({"success": True, "collections": collections, "count": len(collections)}, indent=2)
 
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, indent=2)

@@ -215,7 +215,7 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
 </context_before>
 
 <code_example>
-{code[:1500]}
+{code[:50]}
 </code_example>
 
 <context_after>
